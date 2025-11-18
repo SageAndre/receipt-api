@@ -1,16 +1,15 @@
 import os
 import pytesseract
 from PIL import Image
+import io
 import re
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-# If we are on Windows (your PC), tell Python where Tesseract is installed.
-# If we are on the Cloud (Linux), it finds it automatically.
+# Windows Path: Verify this matches your actual installation!
 if os.name == 'nt':
-    # This assumes you installed Tesseract to the default location
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 def parse_receipt_data(text):
@@ -21,11 +20,12 @@ def parse_receipt_data(text):
         "currency": "Unknown"
     }
 
-    # 1. DATE HUNTING (Standard formats)
+    # 1. DATE HUNTING
+    # Looks for YYYY-MM-DD, DD-MM-YYYY, or DD MMM YYYY
     date_patterns = [
-        r'\d{4}[-/]\d{2}[-/]\d{2}',       # 2025-11-02
-        r'\d{2}[-/]\d{2}[-/]\d{4}',       # 02-11-2025
-        r'\d{2}\s[A-Za-z]{3}\s\d{4}'      # 02 Nov 2025
+        r'\d{4}[-/]\d{2}[-/]\d{2}',
+        r'\d{2}[-/]\d{2}[-/]\d{4}',
+        r'\d{2}\s[A-Za-z]{3}\s\d{4}'
     ]
     for pattern in date_patterns:
         match = re.search(pattern, text)
@@ -33,15 +33,14 @@ def parse_receipt_data(text):
             data["date"] = match.group(0)
             break
 
-    # 2. SMART TOTAL HUNTING (Largest number with a decimal)
-    # Looks for numbers like 79.27 or 1,000.00
+    # 2. SMART TOTAL HUNTING
+    # Looks for decimal numbers like 79.27
     price_pattern = r'(\d{1,3}(?:,\d{3})*\.\d{2})'
     prices = re.findall(price_pattern, text)
-    
     valid_prices = []
     for p in prices:
         try:
-            # Remove commas to convert to float
+            # Clean up string (remove commas) and convert to float
             valid_prices.append(float(p.replace(',', '')))
         except:
             continue
@@ -52,7 +51,6 @@ def parse_receipt_data(text):
     # 3. CURRENCY & VENDOR
     if "P" in text: data["currency"] = "P"
     
-    # Vendor guess: First line that is longer than 3 chars and isn't "Receipt"
     for line in text.split('\n'):
         clean = line.strip()
         if len(clean) > 3 and "invoice" not in clean.lower():
@@ -75,13 +73,21 @@ def process_receipt():
         return jsonify({"error": "No selected file"}), 400
 
     try:
-        # Open image with Pillow
-        image = Image.open(file.stream)
+        # --- FIX: Load image safely into memory first ---
+        image_bytes = file.read()
+        image = Image.open(io.BytesIO(image_bytes))
         
-        # The Magic: Tesseract extracts text
+        # --- FIX: Convert to RGB to prevent alpha channel issues ---
+        image = image.convert('RGB')
+        
+        print(f"Processing file: {file.filename}...") # Debug print
+        
+        # Perform OCR
         raw_text = pytesseract.image_to_string(image)
         
-        # Parse it
+        print(f"Raw Text Found: {raw_text[:50]}...") # Debug print
+        
+        # Parse Data
         structured_data = parse_receipt_data(raw_text)
 
         return jsonify({
@@ -91,6 +97,7 @@ def process_receipt():
         }), 200
 
     except Exception as e:
+        print(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
