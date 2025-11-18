@@ -1,111 +1,69 @@
 import os
-import easyocr
+import pytesseract
+from PIL import Image
 import re
 from flask import Flask, jsonify, request
 
-print("Loading EasyOCR model...")
-reader = easyocr.Reader(['en']) 
-print("EasyOCR model loaded successfully!")
-
 app = Flask(__name__)
 
-def extract_float(text):
-    """
-    Extracts the first valid float from a string.
-    Example: "P 79.27" -> 79.27
-    """
-    # Regex to find numbers like 79.27, 1,000.00, or 500
-    # It handles optional commas and currency symbols are ignored by looking for digits
-    match = re.search(r'(\d{1,3}(?:,\d{3})*(?:\.\d+)?)', text)
-    if match:
-        try:
-            # Remove commas for conversion (1,000.00 -> 1000.00)
-            return float(match.group(1).replace(',', ''))
-        except ValueError:
-            return None
-    return None
+# --- CONFIGURATION ---
+# If we are on Windows (your PC), tell Python where Tesseract is installed.
+# If we are on the Cloud (Linux), it finds it automatically.
+if os.name == 'nt':
+    # This assumes you installed Tesseract to the default location
+    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-def parse_receipt_data(text_lines):
+def parse_receipt_data(text):
     data = {
         "vendor": None,
         "date": None,
         "total": None,
-        "currency": "Unknown" # We will try to detect this
+        "currency": "Unknown"
     }
 
-    # --- 1. UNIVERSAL DATE SEARCH ---
-    # Patterns: YYYY-MM-DD, DD/MM/YYYY, DD-MM-YYYY
+    # 1. DATE HUNTING (Standard formats)
     date_patterns = [
         r'\d{4}[-/]\d{2}[-/]\d{2}',       # 2025-11-02
         r'\d{2}[-/]\d{2}[-/]\d{4}',       # 02-11-2025
         r'\d{2}\s[A-Za-z]{3}\s\d{4}'      # 02 Nov 2025
     ]
+    for pattern in date_patterns:
+        match = re.search(pattern, text)
+        if match:
+            data["date"] = match.group(0)
+            break
+
+    # 2. SMART TOTAL HUNTING (Largest number with a decimal)
+    # Looks for numbers like 79.27 or 1,000.00
+    price_pattern = r'(\d{1,3}(?:,\d{3})*\.\d{2})'
+    prices = re.findall(price_pattern, text)
     
-    for line in text_lines:
-        clean_line = line.replace(" ", "") # Remove spaces for easier matching
-        for pattern in date_patterns:
-            match = re.search(pattern, clean_line)
-            if match:
-                data["date"] = match.group(0)
-                break # Stop after finding the first valid date
-        if data["date"]: break
-
-    # --- 2. SMART TOTAL HUNTING ---
-    # Strategy: Look for keywords, then find the number associated with them.
-    total_keywords = ["total", "amount due", "balance", "grand total", "payment"]
-    potential_totals = []
-
-    for i, line in enumerate(text_lines):
-        line_lower = line.lower()
-        
-        # Check if this line contains a "Total" keyword
-        if any(keyword in line_lower for keyword in total_keywords):
+    valid_prices = []
+    for p in prices:
+        try:
+            # Remove commas to convert to float
+            valid_prices.append(float(p.replace(',', '')))
+        except:
+            continue
             
-            # Case A: The number is on the SAME line (e.g., "Total: 79.27")
-            val = extract_float(line)
-            if val: 
-                potential_totals.append(val)
-            
-            # Case B: The number is on the NEXT line (OCR split them)
-            if i + 1 < len(text_lines):
-                val_next = extract_float(text_lines[i+1])
-                if val_next:
-                    potential_totals.append(val_next)
-    
-    # Decision: Usually the "Total" is the largest amount found near a keyword.
-    if potential_totals:
-        data["total"] = max(potential_totals)
-    else:
-        # Fallback: Find the largest number in the text that looks like a price (has a decimal)
-        all_floats = []
-        for line in text_lines:
-            val = extract_float(line)
-            if val and "." in line: # Ensure it has a decimal part to avoid phone numbers
-                all_floats.append(val)
-        if all_floats:
-            data["total"] = max(all_floats)
+    if valid_prices:
+        data["total"] = max(valid_prices)
 
-    # --- 3. CURRENCY DETECTION ---
-    # Simple check for common symbols
-    full_text = " ".join(text_lines)
-    if "P" in full_text and "Botswana" in full_text: data["currency"] = "BWP"
-    elif "P" in full_text: data["currency"] = "P"
-    elif "$" in full_text: data["currency"] = "USD"
-    elif "€" in full_text: data["currency"] = "EUR"
-    elif "£" in full_text: data["currency"] = "GBP"
-
-    # --- 4. VENDOR GUESSING ---
-    # The vendor is usually the first line that isn't generic noise.
-    ignore_words = ["tax invoice", "receipt", "welcome", "copy", "customer"]
+    # 3. CURRENCY & VENDOR
+    if "P" in text: data["currency"] = "P"
     
-    for line in text_lines:
-        # Must be at least 3 chars, mostly letters, and not in our ignore list
-        if len(line) > 3 and any(c.isalpha() for c in line):
-            if not any(bad_word in line.lower() for bad_word in ignore_words):
-                data["vendor"] = line.title()
-                break
+    # Vendor guess: First line that is longer than 3 chars and isn't "Receipt"
+    for line in text.split('\n'):
+        clean = line.strip()
+        if len(clean) > 3 and "invoice" not in clean.lower():
+            data["vendor"] = clean
+            break
 
     return data
+
+@app.route("/")
+def home():
+    return jsonify({"status": "online", "engine": "Tesseract OCR"}), 200
 
 @app.route("/process-receipt", methods=['POST'])
 def process_receipt():
@@ -113,16 +71,23 @@ def process_receipt():
         return jsonify({"error": "No file uploaded"}), 400
     
     file = request.files['receipt_image']
-    
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
     try:
-        image_bytes = file.read()
-        raw_result = reader.readtext(image_bytes, detail=0)
-        structured_data = parse_receipt_data(raw_result)
+        # Open image with Pillow
+        image = Image.open(file.stream)
+        
+        # The Magic: Tesseract extracts text
+        raw_text = pytesseract.image_to_string(image)
+        
+        # Parse it
+        structured_data = parse_receipt_data(raw_text)
 
         return jsonify({
             "status": "success",
             "data": structured_data,
-            "raw_text": raw_result
+            "raw_text_lines": raw_text.split('\n')
         }), 200
 
     except Exception as e:

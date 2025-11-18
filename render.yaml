@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: receipt-api
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    pkgManagers:
+      - name: apt
+        packages:
+          - tesseract-ocr
