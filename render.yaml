@@ -1,11 +1,6 @@
 services:
   - type: web
     name: receipt-api
-    env: python
+    env: docker
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
-    pkgManagers:
-      - name: apt
-        packages:
-          - tesseract-ocr
+    region: oregon
